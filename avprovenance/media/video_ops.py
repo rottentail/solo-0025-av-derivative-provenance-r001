@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import MediaOperationFailure
-from .y4m import Y4mClip, Y4mFrame, decode_y4m, encode_y4m
+from .views import DecodedMediaView
+from .y4m import Y4mClip, Y4mFrame, encode_y4m
 
 
 def trim_video(clip: Y4mClip, operation: dict[str, Any]) -> Y4mClip:
@@ -171,16 +172,16 @@ def mirror_video(clip: Y4mClip, operation: dict[str, Any]) -> Y4mClip:
 
 
 def render_video(
-    primary_bytes: bytes,
+    primary_view: DecodedMediaView,
     operations: list[dict[str, Any]],
-    secondary_bytes: bytes | None,
+    secondary_view: DecodedMediaView | None,
 ) -> bytes:
-    if secondary_bytes is not None:
+    if secondary_view is not None:
         raise MediaOperationFailure(
             "VIDEO_SECONDARY_UNSUPPORTED",
             "The current video operation set accepts one source.",
         )
-    clip = decode_y4m(primary_bytes)
+    clip = primary_view.video_clip()
     try:
         for operation in operations:
             operation_type = operation["type"]

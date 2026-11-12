@@ -6,7 +6,8 @@ import math
 from typing import Any
 
 from .errors import MediaOperationFailure
-from .wav import AudioClip, decode_wav, encode_wav, replace_channels
+from .views import DecodedMediaView
+from .wav import AudioClip, encode_wav, replace_channels
 
 
 PCM_MIN = -32768
@@ -107,12 +108,12 @@ def mix_audio(
 
 
 def render_audio(
-    primary_bytes: bytes,
+    primary_view: DecodedMediaView,
     operations: list[dict[str, Any]],
-    secondary_bytes: bytes | None,
+    secondary_view: DecodedMediaView | None,
 ) -> bytes:
-    clip = decode_wav(primary_bytes)
-    secondary = decode_wav(secondary_bytes) if secondary_bytes is not None else None
+    clip = primary_view.audio_clip()
+    secondary = secondary_view.audio_clip() if secondary_view is not None else None
     mixed = False
 
     try:

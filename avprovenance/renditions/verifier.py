@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..errors import RenderFailed, UnsupportedMedia
-from ..media import MediaOperationFailure, apply_media_operations
+from ..media import (
+    DecodedMediaView,
+    MediaOperationFailure,
+    apply_media_operations,
+)
 from ..models import MediaAsset
 from ..serialization import sha256_hex
 
@@ -24,14 +28,14 @@ class VerificationOutcome:
 def reproduce_output(
     *,
     output_asset: MediaAsset,
-    recorded_output_bytes: bytes,
-    primary_bytes: bytes,
+    recorded_output_view: DecodedMediaView,
+    primary_view: DecodedMediaView,
     operations: list[dict[str, Any]],
-    secondary_bytes: bytes | None,
+    secondary_view: DecodedMediaView | None,
 ) -> VerificationOutcome:
     expected_descriptor = output_asset.descriptor.to_dict()
     expected_digest = output_asset.sha256
-    recorded_digest = sha256_hex(recorded_output_bytes)
+    recorded_digest = sha256_hex(recorded_output_view.raw)
     if recorded_digest != expected_digest:
         return VerificationOutcome(
             status="mismatch",
@@ -44,9 +48,9 @@ def reproduce_output(
 
     try:
         outcome = apply_media_operations(
-            primary_bytes,
+            primary_view,
             operations,
-            secondary_bytes,
+            secondary_view,
         )
     except (MediaOperationFailure, UnsupportedMedia, RenderFailed) as exc:
         reason = getattr(exc, "code", "reproduction_failed")

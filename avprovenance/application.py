@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 from .errors import (
     ApplicationError,
     IntegrityMismatch,
+    PersistenceFailure,
     PlanInvalid,
+    RenderFailed,
     RenditionNotCompleted,
+    UnsupportedMedia,
 )
 from .models import (
     IntegrityAudit,
@@ -17,7 +21,11 @@ from .models import (
     ProvenanceEdge,
     Rendition,
 )
-from .media import inspect_media
+from .media import (
+    MediaViewLease,
+    MediaViewRegistry,
+    inspect_media,
+)
 from .renditions import (
     compile_plan,
     execute_plan,
@@ -48,9 +56,9 @@ class MediaProvenanceApplication:
         self.content_files = ContentFileRepository(self.data_dir / "content")
         self.state_file = JsonStateFile(self.data_dir / "state.json")
         self.repository = ProvenanceRepository(self.state_file)
-
-    def _asset_bytes(self, asset: MediaAsset) -> bytes:
-        return self.content_files.read(asset.content_key)
+        # The application owns the shared read-only view registry. Loading a
+        # view reads bytes through the content repository on a cache miss.
+        self.view_registry = MediaViewRegistry(self.content_files.read)
 
     def _rendition_view(self, rendition: Rendition) -> dict[str, Any]:
         value = rendition.to_dict()
@@ -72,23 +80,29 @@ class MediaProvenanceApplication:
         content_key = self.content_files.key_for_digest(digest)
         existed = self.content_files.exists(content_key)
         self.content_files.write(data, digest)
-        asset = MediaAsset(
-            id=new_identifier("asset"),
-            filename=safe_name,
-            kind=descriptor.kind,
-            sha256=digest,
-            size_bytes=len(data),
-            content_key=content_key,
-            descriptor=descriptor,
-            created_at=utc_now(),
-        )
+        # Publish a shared, read-only view for the freshly stored bytes. The
+        # lease is released before returning regardless of persistence outcome.
+        lease = self.view_registry.register_bytes(content_key, data)
         try:
-            persisted = self.repository.create_asset(asset)
-        except Exception:
-            if not existed:
-                self.content_files.remove(content_key)
-            raise
-        return persisted.to_public_dict()
+            asset = MediaAsset(
+                id=new_identifier("asset"),
+                filename=safe_name,
+                kind=descriptor.kind,
+                sha256=digest,
+                size_bytes=len(data),
+                content_key=content_key,
+                descriptor=descriptor,
+                created_at=utc_now(),
+            )
+            try:
+                persisted = self.repository.create_asset(asset)
+            except Exception:
+                if not existed:
+                    self.content_files.remove(content_key)
+                raise
+            return persisted.to_public_dict()
+        finally:
+            lease.release()
 
     def get_asset(self, asset_id: str) -> dict[str, Any]:
         return self.repository.get_asset(asset_id).to_public_dict()
@@ -152,52 +166,72 @@ class MediaProvenanceApplication:
         self.repository.create_rendition(rendition)
         self.repository.transition_rendition(rendition.id, "running")
 
+        # Every media usage in this request is bound to one scope: whether the
+        # render succeeds, fails, or the caller disconnects, exiting the scope
+        # returns each lease exactly once and never touches another request's
+        # lease. The media layer only sees immutable views, never the leases.
         try:
-            primary_bytes = self._asset_bytes(primary)
-            secondary_bytes = self._asset_bytes(secondary) if secondary else None
-            outcome = execute_plan(
-                primary_bytes,
-                plan.operations,
-                secondary_bytes,
-            )
-            output_digest = sha256_hex(outcome.data)
-            output_key = self.content_files.key_for_digest(output_digest)
-            output_existed = self.content_files.exists(output_key)
-            self.content_files.write(outcome.data, output_digest)
-            output_asset = MediaAsset(
-                id=new_identifier("asset"),
-                filename=output_name,
-                kind=outcome.descriptor.kind,
-                sha256=output_digest,
-                size_bytes=len(outcome.data),
-                content_key=output_key,
-                descriptor=outcome.descriptor,
-                created_at=utc_now(),
-            )
-            edge = ProvenanceEdge(
-                id=new_identifier("edge"),
-                rendition_id=rendition.id,
-                parent_asset_ids=[
-                    item
-                    for item in (primary.id, secondary.id if secondary else None)
-                    if item is not None
-                ],
-                operation_types=list(outcome.operation_types),
-                plan_digest=plan.digest,
-                output_asset_id=output_asset.id,
-                created_at=utc_now(),
-            )
-            try:
-                completed = self.repository.complete_rendition(
-                    rendition.id,
-                    output_asset,
-                    edge,
+            with ExitStack() as leases:
+                try:
+                    primary_lease = self.view_registry.acquire(
+                        primary.content_key
+                    )
+                    leases.push(primary_lease)
+                    secondary_lease: MediaViewLease | None = None
+                    if secondary is not None:
+                        secondary_lease = self.view_registry.acquire(
+                            secondary.content_key
+                        )
+                        leases.push(secondary_lease)
+                except UnsupportedMedia as exc:
+                    raise RenderFailed(
+                        "The rendition could not be produced.",
+                        details={"reason": exc.code},
+                    ) from exc
+
+                outcome = execute_plan(
+                    primary_lease.view,
+                    plan.operations,
+                    secondary_lease.view if secondary_lease else None,
                 )
-            except Exception:
-                if not output_existed:
-                    self.content_files.remove(output_key)
-                raise
-            return self._rendition_view(completed)
+                output_digest = sha256_hex(outcome.data)
+                output_key = self.content_files.key_for_digest(output_digest)
+                output_existed = self.content_files.exists(output_key)
+                self.content_files.write(outcome.data, output_digest)
+                output_asset = MediaAsset(
+                    id=new_identifier("asset"),
+                    filename=output_name,
+                    kind=outcome.descriptor.kind,
+                    sha256=output_digest,
+                    size_bytes=len(outcome.data),
+                    content_key=output_key,
+                    descriptor=outcome.descriptor,
+                    created_at=utc_now(),
+                )
+                edge = ProvenanceEdge(
+                    id=new_identifier("edge"),
+                    rendition_id=rendition.id,
+                    parent_asset_ids=[
+                        item
+                        for item in (primary.id, secondary.id if secondary else None)
+                        if item is not None
+                    ],
+                    operation_types=list(outcome.operation_types),
+                    plan_digest=plan.digest,
+                    output_asset_id=output_asset.id,
+                    created_at=utc_now(),
+                )
+                try:
+                    completed = self.repository.complete_rendition(
+                        rendition.id,
+                        output_asset,
+                        edge,
+                    )
+                except Exception:
+                    if not output_existed:
+                        self.content_files.remove(output_key)
+                    raise
+                return self._rendition_view(completed)
         except ApplicationError as exc:
             current = self.repository.get_rendition(rendition.id)
             if current.status == "running":
@@ -288,19 +322,6 @@ class MediaProvenanceApplication:
             self._finish_mismatch(audit, "provenance_unavailable")
 
         expected_descriptor = output_asset.descriptor.to_dict()
-        try:
-            recorded_output = self._asset_bytes(output_asset)
-            primary_bytes = self._asset_bytes(primary_asset)
-            secondary_bytes = (
-                self._asset_bytes(secondary_asset) if secondary_asset else None
-            )
-        except ApplicationError:
-            self._finish_mismatch(
-                audit,
-                "source_or_output_unavailable",
-                expected_digest=output_asset.sha256,
-                expected_descriptor=expected_descriptor,
-            )
 
         if edge.plan_digest != rendition.plan_digest:
             self._finish_mismatch(
@@ -324,13 +345,45 @@ class MediaProvenanceApplication:
                 expected_descriptor=expected_descriptor,
             )
 
-        outcome = reproduce_output(
-            output_asset=output_asset,
-            recorded_output_bytes=recorded_output,
-            primary_bytes=primary_bytes,
-            operations=deep_copy(rendition.operations),
-            secondary_bytes=secondary_bytes,
-        )
+        # Replay holds its own leases for the recorded output and both
+        # parents. They are returned as soon as reproduction completes, even
+        # on a mismatch or an interrupted request, and cannot be reclaimed
+        # while this scope is still reading them.
+        try:
+            with ExitStack() as leases:
+                recorded_output_lease = self.view_registry.acquire(
+                    output_asset.content_key
+                )
+                leases.push(recorded_output_lease)
+                primary_lease = self.view_registry.acquire(
+                    primary_asset.content_key
+                )
+                leases.push(primary_lease)
+                secondary_lease = (
+                    self.view_registry.acquire(secondary_asset.content_key)
+                    if secondary_asset
+                    else None
+                )
+                if secondary_lease is not None:
+                    leases.push(secondary_lease)
+
+                outcome = reproduce_output(
+                    output_asset=output_asset,
+                    recorded_output_view=recorded_output_lease.view,
+                    primary_view=primary_lease.view,
+                    operations=deep_copy(rendition.operations),
+                    secondary_view=(
+                        secondary_lease.view if secondary_lease else None
+                    ),
+                )
+        except (PersistenceFailure, UnsupportedMedia):
+            self._finish_mismatch(
+                audit,
+                "source_or_output_unavailable",
+                expected_digest=output_asset.sha256,
+                expected_descriptor=expected_descriptor,
+            )
+
         finished = self.repository.settle_integrity_audit(
             audit.id,
             status=outcome.status,
@@ -351,4 +404,4 @@ class MediaProvenanceApplication:
         )
 
     def close(self) -> None:
-        return
+        self.view_registry.close()

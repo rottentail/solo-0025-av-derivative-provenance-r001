@@ -11,6 +11,7 @@ from .audio_ops import render_audio
 from .errors import MediaOperationFailure
 from .inspector import inspect_media
 from .video_ops import render_video
+from .views import DecodedMediaView
 
 
 @dataclass(frozen=True)
@@ -21,23 +22,21 @@ class RenderOutcome:
 
 
 def apply_media_operations(
-    primary_bytes: bytes,
+    primary_view: DecodedMediaView,
     operations: list[dict[str, Any]],
-    secondary_bytes: bytes | None,
+    secondary_view: DecodedMediaView | None,
 ) -> RenderOutcome:
-    primary = inspect_media(primary_bytes)
-    if secondary_bytes is not None:
-        secondary = inspect_media(secondary_bytes)
-        if secondary.kind != primary.kind:
-            raise MediaOperationFailure(
-                "MEDIA_KIND_MISMATCH",
-                "Primary and secondary media must share a media kind.",
-            )
+    primary = primary_view.descriptor
+    if secondary_view is not None and secondary_view.kind != primary.kind:
+        raise MediaOperationFailure(
+            "MEDIA_KIND_MISMATCH",
+            "Primary and secondary media must share a media kind.",
+        )
 
     if primary.kind == "audio":
-        output = render_audio(primary_bytes, operations, secondary_bytes)
+        output = render_audio(primary_view, operations, secondary_view)
     elif primary.kind == "video":
-        output = render_video(primary_bytes, operations, secondary_bytes)
+        output = render_video(primary_view, operations, secondary_view)
     else:
         raise UnsupportedMedia("The primary media kind has no renderer.")
 
